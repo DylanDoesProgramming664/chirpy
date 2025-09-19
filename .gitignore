@@ -1,1 +1,10 @@
+# dotenvx
 .env
+.env.keys
+
+# containers
+CONTAINERFILE
+DOCKERFILE
+
+# executables and build artifacts
+chirpy

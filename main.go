@@ -1,31 +1,54 @@
 package main
 
 import (
+	"chirpy/internal/database"
+	"context"
+
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 
-	_ "github.com/jackc/pgx/v5"
+	pgx "github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/joho/godotenv"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	dbQueries      *database.Queries
 }
 
 func main() {
+	godotenv.Load()
 	const filepathRoot = "."
 	const port = "8080"
-
-	cfg := apiConfig{}
 
 	mux := http.NewServeMux()
 	server := &http.Server{
 		Handler: mux,
 		Addr:    ":" + port,
 	}
+
+	dbURL := os.Getenv("DB_URL")
+	if len(dbURL) == 0 {
+		log.Fatalln("ENV_ERROR: DB_URL cannot be blank")
+	}
+
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("DB_ERROR: %s\n", err)
+	}
+	defer conn.Close(ctx)
+
+	dbQueries := database.New(conn)
+
+	cfg := apiConfig{dbQueries: dbQueries}
 
 	mux.Handle("/app/", cfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(filepathRoot)))))
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -41,18 +64,17 @@ func main() {
 		params := parameters{}
 		err := decoder.Decode(&params)
 		if err != nil {
-			log.Printf("Error decoding parameters: %s\n", err)
 			w.WriteHeader(http.StatusInternalServerError)
-			return
+			log.Fatalf("JSON_ERROR: Could not decode parameters\nERROR_MSG: %s\n", err)
 		}
 
-		type returnVals struct {
+		type responseBody struct {
 			Valid       bool   `json:"valid"`
 			Error       string `json:"error"`
 			CleanedBody string `json:"cleaned_body"`
 		}
 
-		respBody := returnVals{
+		respBody := responseBody{
 			Valid:       true,
 			Error:       "",
 			CleanedBody: params.Body,
@@ -85,14 +107,56 @@ func main() {
 
 		data, err := json.Marshal(respBody)
 		if err != nil {
-			log.Printf("Error marshalling JSON: %s\n", err)
-			return
+			log.Fatalf("JSON_ERROR: Could not encode response body\nERROR_MSG: %s\n", err)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		w.Write(append(data, '\n'))
-		log.Printf("%+v\n", string(data))
+		w.Write(data)
+		log.Printf("%s\n", data)
+	})
+	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email string `json:"email"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			log.Fatalf("JSON_ERROR: Could not decode parameters\nERROR_MSG: %s\n", err)
+		}
+
+		user, err := cfg.dbQueries.CreateUser(r.Context(), params.Email)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			log.Fatalf("SQLC_ERROR: Could not create user\nERROR_MSG: %s\n", err)
+		}
+
+		type responseBody struct {
+			ID        pgtype.UUID      `json:"id"`
+			CreatedAt pgtype.Timestamp `json:"created_at"`
+			UpdatedAt pgtype.Timestamp `json:"updated_at"`
+			Email     string           `json:"email"`
+		}
+
+		respBody := responseBody{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		}
+
+		data, err := json.Marshal(respBody)
+		if err != nil {
+			log.Fatalf("JSON_ERROR: Could not encode response body.\nERROR_VAL: %s\n", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		w.Write(data)
+		log.Printf("%s\n", data)
 	})
 	mux.HandleFunc("GET /admin/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "text/plain; charset=utf-8")
@@ -103,9 +167,9 @@ func main() {
   </body>
 </html>`, cfg.fileserverHits.Load()))
 	})
-	mux.HandleFunc("POST /admin/reset", cfg.metricsReset)
+	mux.HandleFunc("POST /admin/reset", cfg.dataReset)
 
-	log.Printf("Serving files from %s on port: %s", filepathRoot, port)
+	log.Printf("Serving files from %s:%s\n", filepathRoot, port)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -116,7 +180,17 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
-func (cfg *apiConfig) metricsReset(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) dataReset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	cfg.fileserverHits.Store(0)
+	platform := os.Getenv("PLATFORM")
+	if len(platform) == 0 {
+		log.Fatalf("ENV_ERROR: PLATFORM cannot be an empty string.")
+	}
+	if platform != "dev" {
+		w.WriteHeader(http.StatusForbidden)
+		log.Println("PLATFORM is not 'dev'. User database will not be reset.")
+		return
+	}
+	cfg.dbQueries.DeleteUsers(r.Context())
 }
