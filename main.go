@@ -1,9 +1,8 @@
 package main
 
 import (
-	"chirpy/internal/database"
+	//stdlib
 	"context"
-
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,9 +11,16 @@ import (
 	"strings"
 	"sync/atomic"
 
-	pgx "github.com/jackc/pgx/v5"
+	//chirpy
+	"chirpy/internal/database"
+
+	//dependencies
+
+	"github.com/gofrs/uuid/v5"
+	_ "github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/joho/godotenv"
+	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/joho/godotenv/autoload"
 )
 
 type apiConfig struct {
@@ -23,7 +29,6 @@ type apiConfig struct {
 }
 
 func main() {
-	godotenv.Load()
 	const filepathRoot = "."
 	const port = "8080"
 
@@ -40,13 +45,13 @@ func main() {
 
 	ctx := context.Background()
 
-	conn, err := pgx.Connect(ctx, dbURL)
+	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
-		log.Fatalf("DB_ERROR: %s\n", err)
+		log.Fatalf("DBPOOL_ERROR: %s\n", err)
 	}
-	defer conn.Close(ctx)
+	defer pool.Close()
 
-	dbQueries := database.New(conn)
+	dbQueries := database.New(pool)
 
 	cfg := apiConfig{dbQueries: dbQueries}
 
@@ -54,66 +59,6 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte(http.StatusText(http.StatusOK)))
-	})
-	mux.HandleFunc("POST /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
-		type parameters struct {
-			Body string `json:"body"`
-		}
-
-		decoder := json.NewDecoder(r.Body)
-		params := parameters{}
-		err := decoder.Decode(&params)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			log.Fatalf("JSON_ERROR: Could not decode parameters\nERROR_MSG: %s\n", err)
-		}
-
-		type responseBody struct {
-			Valid       bool   `json:"valid"`
-			Error       string `json:"error"`
-			CleanedBody string `json:"cleaned_body"`
-		}
-
-		respBody := responseBody{
-			Valid:       true,
-			Error:       "",
-			CleanedBody: params.Body,
-		}
-
-		status := http.StatusOK
-
-		if len(params.Body) > 140 {
-			respBody.Valid = false
-			respBody.Error = "This chirp is too long"
-			status = http.StatusBadRequest
-		}
-
-		bannedWords := []string{
-			"kerfuffle",
-			"sharbert",
-			"fornax",
-		}
-
-		bodyTokens := strings.Split(respBody.CleanedBody, " ")
-		for index, token := range bodyTokens {
-			for _, word := range bannedWords {
-				if strings.EqualFold(token, word) {
-					bodyTokens[index] = "****"
-				}
-			}
-		}
-
-		respBody.CleanedBody = strings.Join(bodyTokens, " ")
-
-		data, err := json.Marshal(respBody)
-		if err != nil {
-			log.Fatalf("JSON_ERROR: Could not encode response body\nERROR_MSG: %s\n", err)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		w.Write(data)
-		log.Printf("%s\n", data)
 	})
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
@@ -125,17 +70,17 @@ func main() {
 		err := decoder.Decode(&params)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			log.Fatalf("JSON_ERROR: Could not decode parameters\nERROR_MSG: %s\n", err)
+			log.Fatalf("JSON_ERROR: Could not decode parameters\nERROR_BODY: %s\n", err)
 		}
 
 		user, err := cfg.dbQueries.CreateUser(r.Context(), params.Email)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			log.Fatalf("SQLC_ERROR: Could not create user\nERROR_MSG: %s\n", err)
+			log.Fatalf("SQLC_ERROR: Could not create user\nERROR_BODY: %s\n", err)
 		}
 
 		type responseBody struct {
-			ID        pgtype.UUID      `json:"id"`
+			ID        uuid.UUID        `json:"id"`
 			CreatedAt pgtype.Timestamp `json:"created_at"`
 			UpdatedAt pgtype.Timestamp `json:"updated_at"`
 			Email     string           `json:"email"`
@@ -157,6 +102,120 @@ func main() {
 		w.WriteHeader(http.StatusCreated)
 		w.Write(data)
 		log.Printf("%s\n", data)
+	})
+	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Body   string    `json:"body"`
+			UserID uuid.UUID `json:"user_id"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			log.Fatalf("JSON_ERROR: Could not decode parameters\nERROR_BODY: %s\n", err)
+		}
+
+		type responseBody struct {
+			Valid     bool             `json:"valid"`
+			Error     string           `json:"error"`
+			ID        uuid.UUID        `json:"id"`
+			CreatedAt pgtype.Timestamp `json:"created_at"`
+			UpdatedAt pgtype.Timestamp `json:"updated_at"`
+			Body      string           `json:"body"`
+			UserID    uuid.UUID        `json:"user_id"`
+		}
+
+		chirp, err := cfg.dbQueries.CreateChirp(ctx, database.CreateChirpParams{
+			Body:   params.Body,
+			UserID: params.UserID,
+		})
+		if err != nil {
+			log.Fatalf("DB_ERROR: Could not create chirp\nERROR_BODY: %s\n", err)
+		}
+
+		respBody := responseBody{
+			Valid:     true,
+			Error:     "",
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			UserID:    chirp.UserID,
+		}
+
+		status := http.StatusCreated
+
+		if len(params.Body) > 140 {
+			respBody.Valid = false
+			respBody.Error = "This chirp is too long"
+			status = http.StatusBadRequest
+		}
+
+		bannedWords := []string{
+			"kerfuffle",
+			"sharbert",
+			"fornax",
+		}
+
+		bodyTokens := strings.Split(chirp.Body, " ")
+		for index, token := range bodyTokens {
+			for _, word := range bannedWords {
+				if strings.EqualFold(token, word) {
+					bodyTokens[index] = "****"
+				}
+			}
+		}
+
+		chirp.Body = strings.Join(bodyTokens, " ")
+		respBody.Body = chirp.Body
+
+		data, err := json.Marshal(respBody)
+		if err != nil {
+			log.Fatalf("JSON_ERROR: Could not encode response body\nERROR_BODY: %s\n", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write(data)
+		log.Printf("%s\n", data)
+	})
+	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		chirps, err := cfg.dbQueries.GetAllChirps(ctx)
+		if err != nil {
+			log.Fatalf("DB_ERROR: Could not collect chirps\nERROR_BODY: %s\n", err)
+		}
+
+		data, err := json.Marshal(chirps)
+		if err != nil {
+			log.Fatalf("JSON_ERROR: Could not encode json\nERROR_BODY: %s\n", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		log.Printf("%s\n", data)
+	})
+	mux.HandleFunc("GET /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		chirpID := r.PathValue("chirpID")
+		log.Printf("A GET request was made to /api/chirps/%s\n", chirpID)
+
+		chirpUUID := uuid.FromStringOrNil(chirpID)
+
+		chirp, err := cfg.dbQueries.GetChirp(ctx, chirpUUID)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		data, err := json.Marshal(chirp)
+		if err != nil {
+			log.Fatalf("JSON_ERROR: Could not encode json\nERROR_BODY: %s\n", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
 	})
 	mux.HandleFunc("GET /admin/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "text/plain; charset=utf-8")

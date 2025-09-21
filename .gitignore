@@ -8,3 +8,7 @@ DOCKERFILE
 
 # executables and build artifacts
 chirpy
+
+# fossil artifacts
+.fslckout
+chirpy.fossil
